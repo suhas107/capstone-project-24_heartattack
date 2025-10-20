@@ -1,7 +1,8 @@
 import numpy as np
 import sys
 import os
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import StandardScaler
 
 # Add parent directory to path for imports
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -13,115 +14,154 @@ from src.models import HealthTask, Patient
 
 class PriorityCalculator:
     def __init__(self):
-        # Normal ranges for general patients (taken from www.heart.org and www.medscape.com)
+        # Normal ranges for general patients
         self.normal_ranges = {
             'heart_rate': (60, 100),      # bpm
-            'blood_pressure': (90, 120),   # mmHg
-            'glucose_level': (70, 140)     # mg/dL
+            'blood_pressure': (90, 120),  # mmHg
+            'glucose_level': (70, 140)    # mg/dL
         }
-        
-        # Parameter weights for m-value (urgency hierarchy/tie breaking mechanism)
+
+        # Parameter weights for m-value
         self.parameter_weights = {
             'heart_rate': 3.0,
             'blood_pressure': 2.0,
             'glucose_level': 1.0
         }
-        
-        # ML models for specific patients
-        self.ml_model_k = None
-        self.ml_model_m = None
+
+        # ANN models and scalers
+        self.ann_model_k = None
+        self.ann_model_m = None
+        self.feature_scaler = None
         self.train_ml_models()
-    
+
     def train_ml_models(self):
-        """Train ML models using medical data"""
+        """Train ANN regressors (MLPRegressor) using medical data."""
         try:
-            # Import our real data loader
             from src.real_data_loader import RealDataLoader
-            
-            # Load real medical data
             data_loader = RealDataLoader()
             real_data = data_loader.load_real_training_data()
-            
-            # Prepare features for ML model
+            if real_data is None or len(real_data) == 0:
+                print("PriorityCalculator: No real data returned for training; skipping ANN training.")
+                return
             feature_columns = ['heart_rate', 'blood_pressure', 'glucose_level', 'age', 'height', 'weight', 'gender']
-            X = real_data[feature_columns].values
-            
-            # Use calculated k and m values
-            y_k = real_data['k_value'].values
-            y_m = real_data['m_value'].values
-            
-            # Train models with real medical patterns
-            self.ml_model_k = RandomForestRegressor(n_estimators=100, random_state=42)
-            self.ml_model_m = RandomForestRegressor(n_estimators=100, random_state=42)
-            
-            self.ml_model_k.fit(X, y_k)
-            self.ml_model_m.fit(X, y_m)
-            
+            for col in feature_columns:
+                if col not in real_data.columns:
+                    raise ValueError(f"Expected feature column '{col}' not found in real_data")
+            X = real_data[feature_columns].values.astype(float)
+            if real_data['gender'].dtype == object:
+                gender_map = {'M': 1, 'F': 0, 'm': 1, 'f': 0}
+                X[:, -1] = real_data['gender'].map(lambda v: gender_map.get(v, 0)).astype(float)
+            if 'k_value' not in real_data.columns or 'm_value' not in real_data.columns:
+                raise ValueError("Training data must contain 'k_value' and 'm_value' columns")
+            y_k = real_data['k_value'].values.astype(float)
+            y_m = real_data['m_value'].values.astype(float)
+            self.feature_scaler = StandardScaler()
+            X_scaled = self.feature_scaler.fit_transform(X)
+            ann_kwargs = {
+                'hidden_layer_sizes': (32, 16, 8),
+                'activation': 'relu',
+                'solver': 'adam',
+                'learning_rate_init': 0.001,
+                'max_iter': 500,
+                'random_state': 42,
+                'early_stopping': True,
+                'n_iter_no_change': 20,
+                'verbose': False
+            }
+
+            # Create & train model for k and m
+            self.ann_model_k = MLPRegressor(**ann_kwargs)
+            self.ann_model_m = MLPRegressor(**ann_kwargs)
+
+            print("PriorityCalculator: Training ANN for k_value...")
+            self.ann_model_k.fit(X_scaled, y_k)
+            print("PriorityCalculator: Training ANN for m_value...")
+            self.ann_model_m.fit(X_scaled, y_m)
+
+            print("PriorityCalculator: ANN training complete.")
+
         except Exception as e:
-            print(f"Error in real data training: {e}")  
-    
+            print(f"PriorityCalculator: Error during ANN training: {e}")
+            self.ann_model_k = None
+            self.ann_model_m = None
+            self.feature_scaler = None
+
     def _calculate_parameter_urgency(self, value: float, lower_bound: float, upper_bound: float) -> float:
-        """Calculate urgency for a single parameter using research paper's formula"""
-        # Research Paper's urgency formula: |(ub - value)² - (lb - value)²| / (ub - lb)²
-        urgency = abs((upper_bound - value)**2 - (lower_bound - value)**2) / (upper_bound - lower_bound)**2
-        return min(urgency, 2.0)  # Cap at 2.0
-    
+        """Calculate urgency for a single parameter using the research formula."""
+        # |(ub - value)^2 - (lb - value)^2| / (ub - lb)^2
+        try:
+            denom = (upper_bound - lower_bound) ** 2
+            if denom == 0:
+                return 0.0
+            urgency = abs((upper_bound - value) ** 2 - (lower_bound - value) ** 2) / denom
+            return float(min(urgency, 2.0))
+        except Exception:
+            return 0.0
+
     def calculate_general_priority(self, task: HealthTask) -> tuple[float, float]:
-        """Calculate priority for general patient type using rule-based approach"""
-        # Calculate k-value for each parameter
-        hr_k = self._calculate_parameter_urgency(
-            task.heart_rate, *self.normal_ranges['heart_rate']
-        )
-        bp_k = self._calculate_parameter_urgency(
-            task.blood_pressure, *self.normal_ranges['blood_pressure']
-        )
-        glucose_k = self._calculate_parameter_urgency(
-            task.glucose_level, *self.normal_ranges['glucose_level']
-        )
-        
-        # k-value is maximum of all parameter urgencies
+        """Calculate priority for general patient type using a deterministic rule-based approach."""
+        hr_k = self._calculate_parameter_urgency(task.heart_rate, *self.normal_ranges['heart_rate'])
+        bp_k = self._calculate_parameter_urgency(task.blood_pressure, *self.normal_ranges['blood_pressure'])
+        glucose_k = self._calculate_parameter_urgency(task.glucose_level, *self.normal_ranges['glucose_level'])
+
         k_value = max(hr_k, bp_k, glucose_k)
-        
-        # Calculate m-value based on most critical parameter
+
         urgencies = {
             'heart_rate': hr_k,
             'blood_pressure': bp_k,
             'glucose_level': glucose_k
         }
-        
         most_critical = max(urgencies, key=urgencies.get)
-        m_value = self.parameter_weights[most_critical]
-        
+        m_value = self.parameter_weights.get(most_critical, 1.0)
+
         return k_value, m_value
-    
+
     def calculate_specific_priority(self, task: HealthTask, patient: Patient) -> tuple[float, float]:
-        """Calculate priority for specific patient type using ML model"""
-        # Prepare features for ML model
+        """Calculate priority for a specific patient type using trained ANN models."""
+        # If ANN not trained, fall back to rule-based
+        if self.ann_model_k is None or self.ann_model_m is None or self.feature_scaler is None:
+            # fallback
+            return self.calculate_general_priority(task)
+
+        # Prepare features for ANN 
+        gender_val = 1 if (patient.gender == 'M' or patient.gender == 'm' or patient.gender == 1) else 0
         features = np.array([[
-            task.heart_rate,
-            task.blood_pressure,
-            task.glucose_level,
-            patient.age,
-            patient.height,
-            patient.weight,
-            1 if patient.gender == 'M' else 0
+            float(task.heart_rate),
+            float(task.blood_pressure),
+            float(task.glucose_level),
+            float(patient.age),
+            float(patient.height),
+            float(patient.weight),
+            float(gender_val)
         ]])
-        
-        k_value = float(self.ml_model_k.predict(features)[0])
-        m_value = float(self.ml_model_m.predict(features)[0])
-        
-        # Ensure k-value is in [0, 2] range
+
+        # Scale features
+        try:
+            features_scaled = self.feature_scaler.transform(features)
+        except Exception:
+            # Fallback to raw if scaler fails
+            features_scaled = features
+
+        # Predict using ANN regressors
+        try:
+            k_value = float(self.ann_model_k.predict(features_scaled)[0])
+            m_value = float(self.ann_model_m.predict(features_scaled)[0])
+        except Exception as e:
+            # If prediction fails, fallback to rule-based
+            print(f"PriorityCalculator: ANN prediction error: {e}; falling back to rule-based.")
+            return self.calculate_general_priority(task)
+
+        # Clamp k_value to [0, 2]
         k_value = max(0.0, min(k_value, 2.0))
-        
         return k_value, m_value
-    
+
     def calculate_task_priority(self, task: HealthTask, patient: Patient) -> HealthTask:
-        """Calculate priority values for a task based on patient type"""
+        """Calculate and attach priority values for a task based on patient type."""
         if task.task_type == 'general':
             k_value, m_value = self.calculate_general_priority(task)
         else:
             k_value, m_value = self.calculate_specific_priority(task, patient)
-        
+
         task.k_value = k_value
         task.m_value = m_value
         return task
